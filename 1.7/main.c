@@ -9,11 +9,14 @@ static void* worker(void* arg)
     return NULL;
 }
 
-
 int main (void) 
 {
     uthread_t t;
     if (uthread_create(&t, worker, (void*)1) != 0) perror("uthread_create");
     else printf("Thread created successfully\n");
+
+    uthread_run(&t);
+    printf("Back to main context\n");
+
     return 0;
 }

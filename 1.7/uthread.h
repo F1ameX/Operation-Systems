@@ -22,6 +22,7 @@ typedef struct uthread {
     struct uthread *next;
 } uthread_t;
 
+void uthread_run(uthread_t *t);
 int uthread_create(uthread_t *t, void *(*start_routine)(void *), void *arg);
 
 #endif
