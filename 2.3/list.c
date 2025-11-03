@@ -31,7 +31,7 @@ Storage *storage_init(int n)
             exit(1);
         }
 
-        int len = rand() % 10 + 1;
+        int len = rand() % 100 + 1;
         for (int j = 0; j < len; j++) node->value[j] = 'a' + rand() % 26;
         node->value[len] = '\0';
 
