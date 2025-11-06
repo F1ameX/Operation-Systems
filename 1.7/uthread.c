@@ -5,12 +5,24 @@
 
 static ucontext_t main_ctx;
 static uthread_t *current = NULL;
+static uthread_t *readyq = NULL;
+
+static void q_push(uthread_t *t) {t->next = readyq; readyq = t;}
+
+static uthread_t* q_pop_ready(void)
+{
+    uthread_t **pp = &readyq;
+    while (*pp && (*pp)->state != UTHREAD_READY) pp = &(*pp)->next;
+    if (!*pp) return NULL;
+    uthread_t *t = *pp; *pp = (*pp)->next; t->next = NULL;
+    return t;
+}
 
 static void uthread_entry(void)
 {
     if (current && current->start_routine) current->retval = current->start_routine(current->arg);
     current->state = UTHREAD_FINISHED;
-    setcontext(&main_ctx);
+    uthread_yield();
 }
 
 int uthread_create(uthread_t *t, void *(*start_routine)(void *), void *arg) 
@@ -23,7 +35,6 @@ int uthread_create(uthread_t *t, void *(*start_routine)(void *), void *arg)
 
     if (getcontext(&t->context) == -1)
     {
-        perror("getcontext");
         free(t->stack);
         return -1;
     }
@@ -38,6 +49,8 @@ int uthread_create(uthread_t *t, void *(*start_routine)(void *), void *arg)
 
     makecontext(&t->context, uthread_entry, 0);
 
+    q_push(t);
+
     return 0;
 }
 
@@ -46,4 +59,48 @@ void uthread_run(uthread_t *t)
     current = t;
     t->state = UTHREAD_RUNNING;
     swapcontext(&main_ctx, &t->context);
+}
+
+void uthread_yield(void)
+{
+    uthread_t *prev = current;
+
+    if (prev && prev->state == UTHREAD_RUNNING) 
+    {
+        prev->state = UTHREAD_READY;
+        q_push(prev);
+    }
+
+    uthread_t *next = q_pop_ready();
+    if (!next) 
+    {
+        if (prev) swapcontext(&prev->context, &main_ctx);
+        return;
+    }
+
+    current = next;
+    next->state = UTHREAD_RUNNING;
+
+    if (prev) swapcontext(&prev->context, &next->context);
+    else swapcontext(&main_ctx, &next->context);
+}
+
+void uthread_run_all(void)
+{
+    while (1) 
+    {
+        uthread_t *t = q_pop_ready();
+        if (!t) break;
+
+        current = t;
+        t->state = UTHREAD_RUNNING;
+        swapcontext(&main_ctx, &t->context);
+
+        if (t->state == UTHREAD_FINISHED && t->stack) 
+        {
+            free(t->stack);
+            t->stack = NULL;
+        } 
+        else if (t->state == UTHREAD_READY) q_push(t);
+    }
 }

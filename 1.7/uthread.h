@@ -24,5 +24,7 @@ typedef struct uthread {
 
 void uthread_run(uthread_t *t);
 int uthread_create(uthread_t *t, void *(*start_routine)(void *), void *arg);
+void uthread_yield(void);
+void uthread_run_all(void);
 
 #endif

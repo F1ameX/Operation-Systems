@@ -2,21 +2,26 @@
 #include "uthread.h"
 #include <stdio.h>
 
-
 static void* worker(void* arg)
 {
-    printf("Hello from worker %ld\n", (long)arg);
+    long id = (long)arg;
+    for (int i = 0; i < 3; ++i) {
+        printf("[uthread %ld] iter %d\n", id, i);
+        uthread_yield();
+    }
     return NULL;
 }
 
-int main (void) 
+int main(void)
 {
-    uthread_t t;
-    if (uthread_create(&t, worker, (void*)1) != 0) perror("uthread_create");
-    else printf("Thread created successfully\n");
+    uthread_t a, b, c;
 
-    uthread_run(&t);
-    printf("Back to main context\n");
+    if (uthread_create(&a, worker, (void*)1) || uthread_create(&b, worker, (void*)2) || uthread_create(&c, worker, (void*)3)) 
+    {
+        perror("uthread_create");
+        return 1;
+    }
 
+    uthread_run_all();
     return 0;
 }
