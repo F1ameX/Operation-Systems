@@ -27,27 +27,27 @@ Storage *storage_init(int n)
         exit(1);
     }
 
-    Node *head = malloc(sizeof(Node));
-    if (!head) 
+    Node *first = malloc(sizeof(Node));
+    if (!first) 
     {
-        perror("malloc head");
+        perror("malloc first");
         exit(1);
     }
 
-    head->value[0] = '\0';
-    head->next = NULL;
-    if (pthread_rwlock_init(&head->sync, NULL) != 0) 
+    first->value[0] = '\0';
+    first->next = NULL;
+    if (pthread_rwlock_init(&first->sync, NULL) != 0) 
     {
-        perror("pthread_rwlock_init head");
+        perror("pthread_rwlock_init first");
         exit(1);
     }
 
-    s->first  = head;
+    s->first  = first;
     s->count = n;
 
     srand((unsigned int)time(NULL));
 
-    Node *prev = head;
+    Node *prev = first;
     for (int i = 0; i < n; i++) 
     {
         Node *node = malloc(sizeof(Node));
@@ -94,7 +94,7 @@ void storage_print(Storage *s)
     if (!s) return;
     printf("Storage contents (%d nodes):\n", s->count);
 
-    Node *cur = s->head->next;
+    Node *cur = s->first->next;
     int i = 0;
     while (cur) 
     {

@@ -27,22 +27,22 @@ Storage *storage_init(int n)
         exit(1);
     }
 
-    Node *head = malloc(sizeof(Node)):
-    if (!head) 
+    Node *first = malloc(sizeof(Node)):
+    if (!first) 
     {
-        perror("malloc head");
+        perror("malloc first");
         exit(1);
     }
 
-    head->value[0] = '\0';
-    head->next = NULL;
-    if (pthread_spin_init(&head->sync, PTHREAD_PROCESS_PRIVATE) != 0) 
+    first->value[0] = '\0';
+    first->next = NULL;
+    if (pthread_spin_init(&first->sync, PTHREAD_PROCESS_PRIVATE) != 0) 
     {
-        perror("pthread_spin_init head");
+        perror("pthread_spin_init first");
         exit(1);
     }
 
-    s->first = head;
+    s->first = first;
     s->count = n;
 
     srand((unsigned int)time(NULL));
