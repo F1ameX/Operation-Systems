@@ -1,142 +1,213 @@
 #define _GNU_SOURCE
 #include "list.h"
 #include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
+#include <unistd.h>
 
-static long asc_iterations = 0;
-static long desc_iterations = 0;
+static long asc_iterations   = 0;
+static long desc_iterations  = 0;
 static long equal_iterations = 0;
-static long swaps_done = 0;
+static long asc_swaps   = 0;
+static long desc_swaps  = 0;
+static long equal_swaps = 0;
 
-void *thread_asc(void *arg) 
+static pthread_mutex_t counters_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void inc_long(long *p)
 {
-    Storage *s = (Storage *)arg;
-    while (1) 
-    {
-        Node *cur = s->first;
-
-        while (cur && cur->next) 
-        {
-            pthread_rwlock_rdlock(&cur->sync);
-            pthread_rwlock_rdlock(&cur->next->sync);
-
-            int l1 = strlen(cur->value);
-            int l2 = strlen(cur->next->value);
-            if (l1 < l2) asc_iterations++;
-
-            pthread_rwlock_unlock(&cur->next->sync);
-            pthread_rwlock_unlock(&cur->sync);
-
-            cur = cur->next;
-        }
-    }
-    return NULL;
+    pthread_mutex_lock(&counters_lock);
+    ++(*p);
+    pthread_mutex_unlock(&counters_lock);
 }
 
-void *thread_desc(void *arg) 
+static void snapshot_counters(long *ai, long *di, long *ei, long *as, long *ds, long *es)
 {
-    Storage *s = (Storage *)arg;
-
-    while (1) 
-    {
-        Node *cur = s->first;
-
-        while (cur && cur->next) 
-        {
-            pthread_rwlock_rdlock(&cur->sync);
-            pthread_rwlock_rdlock(&cur->next->sync);
-
-            int l1 = strlen(cur->value);
-            int l2 = strlen(cur->next->value);
-            if (l1 > l2) desc_iterations++;
-
-            pthread_rwlock_unlock(&cur->next->sync);
-            pthread_rwlock_unlock(&cur->sync);
-
-            cur = cur->next;
-        }
-    }
-    return NULL;
+    pthread_mutex_lock(&counters_lock);
+    *ai = asc_iterations;
+    *di = desc_iterations;
+    *ei = equal_iterations;
+    *as = asc_swaps;
+    *ds = desc_swaps;
+    *es = equal_swaps;
+    pthread_mutex_unlock(&counters_lock);
 }
 
-void *thread_equal(void *arg) 
+typedef int (*pair_predicate)(int l1, int l2);
+
+static int pred_asc(int l1, int l2)   { return l1 < l2; }
+static int pred_desc(int l1, int l2)  { return l1 > l2; }
+static int pred_equal(int l1, int l2) { return l1 == l2; }
+
+static void traverse_list(Storage *s, pair_predicate pred, long *iter_counter)
 {
-    Storage *s = (Storage *)arg;
-
-    while (1) 
+    while (1)
     {
-        Node *cur = s->first;
+        Node *first = s->first;
+        Node *a, *b;
 
-        while (cur && cur->next) 
+        pthread_rwlock_rdlock(&first->sync);
+        a = first->next;
+        if (!a)
         {
-            pthread_rwlock_rdlock(&cur->sync);
-            pthread_rwlock_rdlock(&cur->next->sync);
-
-            int l1 = strlen(cur->value);
-            int l2 = strlen(cur->next->value);
-            if (l1 == l2) equal_iterations++;
-
-            pthread_rwlock_unlock(&cur->next->sync);
-            pthread_rwlock_unlock(&cur->sync);
-
-            cur = cur->next;
-        }
-    }
-    return NULL;
-}
-
-void *thread_swap(void *arg) 
-{
-    Storage *s = (Storage *)arg;
-    srand(time(NULL) ^ getpid());
-
-    while (1) 
-    {
-        int idx = rand() % (s->count - 2);
-        Node *prev = NULL;
-        Node *a = s->first;
-
-        for (int i = 0; i < idx && a && a->next; i++) 
-        {
-            prev = a;
-            a = a->next;
+            pthread_rwlock_unlock(&first->sync);
+            inc_long(iter_counter);
+            continue;
         }
 
-        if (!a || !a->next) continue;
-        Node *b = a->next;
+        pthread_rwlock_rdlock(&a->sync);
+        pthread_rwlock_unlock(&first->sync);
 
-        if (prev) pthread_rwlock_wrlock(&prev->sync);
-        pthread_rwlock_wrlock(&a->sync);
-        pthread_rwlock_wrlock(&b->sync);
+        while (1)
+        {
+            b = a->next;
+            if (!b)
+                break;
 
-        a->next = b->next;
-        b->next = a;
-        if (prev) prev->next = b;
-        else s->first = b;
+            pthread_rwlock_rdlock(&b->sync);
 
-        swaps_done++;
+            int l1 = (int)strlen(a->value);
+            int l2 = (int)strlen(b->value);
 
-        pthread_rwlock_unlock(&b->sync);
+            pthread_rwlock_unlock(&a->sync);
+            a = b;
+        }
+
         pthread_rwlock_unlock(&a->sync);
-        if (prev) pthread_rwlock_unlock(&prev->sync);
+        inc_long(iter_counter);
     }
+}
 
+void *thread_asc(void *arg)
+{
+    traverse_list((Storage *)arg, pred_asc, &asc_iterations);
     return NULL;
 }
 
-void *thread_monitor(void *arg) 
+void *thread_desc(void *arg)
+{
+    traverse_list((Storage *)arg, pred_desc, &desc_iterations);
+    return NULL;
+}
+
+void *thread_equal(void *arg)
+{
+    traverse_list((Storage *)arg, pred_equal, &equal_iterations);
+    return NULL;
+}
+
+static void do_random_swap(Storage *s, pair_predicate need_swap, long *swap_counter, unsigned int *seed)
+{
+    if (s->count < 2) return;
+
+    int index = rand_r(seed) % (s->count - 1);
+
+    Node *prev = s->first;
+    pthread_rwlock_wrlock(&prev->sync);
+
+    Node *a = prev->next;
+    if (!a)
+    {
+        pthread_rwlock_unlock(&prev->sync);
+        return;
+    }
+    pthread_rwlock_wrlock(&a->sync);
+
+    for (int i = 0; i < index; ++i)
+    {
+        Node *next = a->next;
+        if (!next) break;
+
+        pthread_rwlock_wrlock(&next->sync);
+
+        pthread_rwlock_unlock(&prev->sync);
+        prev = a;
+        a = next;
+    }
+
+    Node *b = a->next;
+    if (!b)
+    {
+        pthread_rwlock_unlock(&a->sync);
+        pthread_rwlock_unlock(&prev->sync);
+        return;
+    }
+    pthread_rwlock_wrlock(&b->sync);
+
+    int l1 = (int)strlen(a->value);
+    int l2 = (int)strlen(b->value);
+
+    if (need_swap(l1, l2))
+    {
+        prev->next = b;
+        a->next    = b->next;
+        b->next    = a;
+        inc_long(swap_counter);
+    }
+
+    pthread_rwlock_unlock(&b->sync);
+    pthread_rwlock_unlock(&a->sync);
+    pthread_rwlock_unlock(&prev->sync);
+}
+
+void *thread_swap_asc(void *arg)
+{
+    Storage *s = (Storage *)arg;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+
+    while (1)
+    {
+        do_random_swap(s, pred_asc, &asc_swaps, &seed);
+        sched_yield();
+    }
+    return NULL;
+}
+
+void *thread_swap_desc(void *arg)
+{
+    Storage *s = (Storage *)arg;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+
+    while (1)
+    {
+        do_random_swap(s, pred_desc, &desc_swaps, &seed);
+        sched_yield();
+    }
+    return NULL;
+}
+
+void *thread_swap_equal(void *arg)
+{
+    Storage *s = (Storage *)arg;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+
+    while (1)
+    {
+        do_random_swap(s, pred_equal, &equal_swaps, &seed);
+        sched_yield();
+    }
+    return NULL;
+}
+
+void *thread_monitor(void *arg)
 {
     (void)arg;
-    
-    while (1) 
+
+    while (1)
     {
-        printf("[monitor][rwlock] asc=%ld desc=%ld equal=%ld swaps=%ld\n", asc_iterations, desc_iterations, equal_iterations, swaps_done);
+        long ai, di, ei, as, ds, es;
+        snapshot_counters(&ai, &di, &ei, &as, &ds, &es);
+
+        printf("[monitor][rw] iter: asc=%ld desc=%ld equal=%ld | "
+               "swaps: asc=%ld desc=%ld equal=%ld\n",
+               ai, di, ei, as, ds, es);
         fflush(stdout);
         sleep(2);
     }
+
     return NULL;
 }

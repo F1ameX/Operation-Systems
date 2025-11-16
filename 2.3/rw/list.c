@@ -5,7 +5,18 @@
 #include <string.h>
 #include <time.h>
 
-Storage *storage_init(int n) 
+static void random_string(char *buf, size_t buf_size)
+{
+    const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
+    size_t alpha_len = sizeof(alphabet) - 1;
+    int maxlen = (int)buf_size - 1;
+
+    int len = 1 + rand() % maxlen;
+    for (int i = 0; i < len; ++i) buf[i] = alphabet[rand() % alpha_len];
+    buf[len] = '\0';
+}
+
+Storage *storage_init(int n)
 {
     if (n <= 0) return NULL;
 
@@ -16,12 +27,27 @@ Storage *storage_init(int n)
         exit(1);
     }
 
-    s->first = NULL;
+    Node *head = malloc(sizeof(Node));
+    if (!head) 
+    {
+        perror("malloc head");
+        exit(1);
+    }
+
+    head->value[0] = '\0';
+    head->next = NULL;
+    if (pthread_rwlock_init(&head->sync, NULL) != 0) 
+    {
+        perror("pthread_rwlock_init head");
+        exit(1);
+    }
+
+    s->first  = head;
     s->count = n;
 
-    srand(time(NULL));
+    srand((unsigned int)time(NULL));
 
-    Node *prev = NULL;
+    Node *prev = head;
     for (int i = 0; i < n; i++) 
     {
         Node *node = malloc(sizeof(Node));
@@ -31,25 +57,26 @@ Storage *storage_init(int n)
             exit(1);
         }
 
-        int len = rand() % 100 + 1;
-        for (int j = 0; j < len; j++) node->value[j] = 'a' + rand() % 26;
-        node->value[len] = '\0';
-
-        pthread_rwlock_init(&node->sync, NULL);
+        random_string(node->value, sizeof(node->value));
         node->next = NULL;
 
-        if (prev == NULL) s->first = node;
-        else prev->next = node;
+        if (pthread_rwlock_init(&node->sync, NULL) != 0) 
+        {
+            perror("pthread_rwlock_init node");
+            exit(1);
+        }
 
+        prev->next = node;
         prev = node;
     }
 
     return s;
 }
 
-void storage_destroy(Storage *s) 
+void storage_destroy(Storage *s)
 {
     if (!s) return;
+
     Node *cur = s->first;
     while (cur) 
     {
@@ -62,10 +89,12 @@ void storage_destroy(Storage *s)
     free(s);
 }
 
-void storage_print(Storage *s) 
+void storage_print(Storage *s)
 {
     if (!s) return;
-    Node *cur = s->first;
+    printf("Storage contents (%d nodes):\n", s->count);
+
+    Node *cur = s->head->next;
     int i = 0;
     while (cur) 
     {
