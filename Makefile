@@ -1,7 +1,11 @@
 TARGET = proxy.out
 
 SRCS = main.c \
-       threadpool/threadpool.c
+       proxy/proxy.c \
+       cache/cache.c \
+       threadpool/threadpool.c \
+       logger/logger.c
+
 
 CC = gcc
 CFLAGS = -g -Wall

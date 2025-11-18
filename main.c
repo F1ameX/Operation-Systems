@@ -1,46 +1,20 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 
-#include "threadpool/threadpool.h"
+#include "proxy/proxy.h"
+#include "logger/logger.h"
 
-static void demoTask(void *arg) 
-{
-    long id = *(long *)arg;
-    free(arg);
+int main(void) {
+    logger_init(LOG_DEBUG);
 
-    printf("[task %ld] started\n", id);
-    usleep(100 * 1000);
-    printf("[task %ld] finished\n", id);
-}
+    proxy_config_t cfg;
+    cfg.listen_port = 8080;
+    cfg.worker_count = 8;
 
-int main(void) 
-{
-    threadPool_t *pool = threadPoolCreate(3);
-    if (!pool) 
-    {
-        fprintf(stderr, "failed to create thread pool\n");
-        return 1;
-    }
+    log_info("starting proxy on port %d with %d workers", cfg.listen_port, cfg.worker_count);
 
-    for (long i = 0; i < 8; ++i) 
-    {
-        long *id = malloc(sizeof(long));
-        if (!id) 
-        {
-            fprintf(stderr, "malloc failed\n");
-            break;
-        }
-        *id = i;
-        if (threadPoolSubmit(pool, demoTask, id) != 0) 
-        {
-            fprintf(stderr, "submit failed for task %ld\n", i);
-            free(id);
-        }
-    }
+    int rc = proxy_run(&cfg);
+    if (rc != 0) log_error("proxy failed with code %d", rc);
 
-    sleep(1);
-
-    threadPoolStop(pool);
-    return 0;
+    logger_finalize();
+    return rc;
 }
