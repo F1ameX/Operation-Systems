@@ -1,6 +1,6 @@
+#include "cache/cache.h"
 #include "proxy/proxy.h"
 #include "logger/logger.h"
-
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -13,8 +13,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-typedef struct client_ctx {
+typedef struct client_ctx 
+{
     int client_fd;
+    cache_table_t *cache;
 } client_ctx_t;
 
 static ssize_t send_all(int fd, const void *buf, size_t len) 
@@ -132,10 +134,52 @@ static int connect_to_origin(const char *host, int port)
     return fd;
 }
 
+static void stream_from_cache(cache_entry_t *entry, int client_fd) 
+{
+    size_t offset = 0;
+    char   tmp[4096];
+
+    for (;;) 
+    {
+        pthread_mutex_lock(&entry->lock);
+
+        while (offset == entry->size && !entry->complete && !entry->failed) 
+            pthread_cond_wait(&entry->cond, &entry->lock);
+
+        if (entry->failed) 
+        {
+            pthread_mutex_unlock(&entry->lock);
+            log_error("stream_from_cache: entry failed, stop streaming");
+            break;
+        }
+
+        if (offset == entry->size && entry->complete) 
+        {
+            pthread_mutex_unlock(&entry->lock);
+            log_debug("stream_from_cache: finished for fd=%d", client_fd);
+            break;
+        }
+
+        size_t avail = entry->size - offset;
+        size_t chunk = (avail < sizeof(tmp)) ? avail : sizeof(tmp);
+        memcpy(tmp, entry->data + offset, chunk);
+        offset += chunk;
+
+        pthread_mutex_unlock(&entry->lock);
+
+        if (send_all(client_fd, tmp, chunk) < 0) 
+        {
+            log_error("stream_from_cache: send_all to client fd=%d failed: %s", client_fd, strerror(errno));
+            break;
+        }
+    }
+}
+
 static void handle_client(void *arg) 
 {
     client_ctx_t *ctx = (client_ctx_t *)arg;
     int cfd = ctx->client_fd;
+    cache_table_t *cache = ctx->cache;
     free(ctx);
 
     log_debug("client fd=%d: handler started", cfd);
@@ -153,6 +197,7 @@ static void handle_client(void *arg)
             close(cfd);
             return;
         }
+
         if (n == 0) 
         {
             log_info("client fd=%d: closed connection before headers", cfd);
@@ -242,6 +287,29 @@ static void handle_client(void *arg)
 
     log_debug("client fd=%d: method=%s host=%s uri=%s", cfd, method, host, uri);
 
+    char key[512];
+    snprintf(key, sizeof(key), "%s %s", host, uri);
+
+    int am_writer = 0;
+    cache_entry_t *entry = cache_start_or_join(cache, key, &am_writer);
+    if (!entry) 
+    {
+        log_error("client fd=%d: cache_start_or_join failed for key='%s'", cfd, key);
+        close(cfd);
+        return;
+    }
+
+    log_debug("client fd=%d: key='%s', am_writer=%d", cfd, key, am_writer);
+
+    if (!am_writer) 
+    {
+        log_debug("client fd=%d: reader for key='%s', streaming from cache", cfd, key);
+        stream_from_cache(entry, cfd);
+        cache_release(cache, entry);
+        close(cfd);
+        return;
+    }
+
     int ofd = connect_to_origin(host, 80);
     if (ofd < 0) 
     {
@@ -252,9 +320,13 @@ static void handle_client(void *arg)
             "\r\n";
 
         (void)send_all(cfd, resp, strlen(resp));
+        cache_mark_failed(entry);
+        cache_release(cache, entry);
         close(cfd);
         return;
     }
+
+    log_info("client fd=%d: writer for key='%s', origin fd=%d", cfd, key, ofd);
 
     char req[4096];
     int req_len = snprintf(req, sizeof(req),
@@ -266,6 +338,8 @@ static void handle_client(void *arg)
     if (req_len <= 0 || req_len >= (int)sizeof(req)) 
     {
         log_error("client fd=%d: failed to build HTTP/1.0 request", cfd);
+        cache_mark_failed(entry);
+        cache_release(cache, entry);
         close(ofd);
         close(cfd);
         return;
@@ -276,6 +350,8 @@ static void handle_client(void *arg)
     if (send_all(ofd, req, (size_t)req_len) < 0) 
     {
         log_error("client fd=%d: send_all to origin failed: %s", cfd, strerror(errno));
+        cache_mark_failed(entry);
+        cache_release(cache, entry);
         close(ofd);
         close(cfd);
         return;
@@ -289,23 +365,31 @@ static void handle_client(void *arg)
         {
             if (errno == EINTR) continue;
             log_error("client fd=%d: recv from origin failed: %s", cfd, strerror(errno));
+            cache_mark_failed(entry);
             break;
         }
+
         if (n == 0) 
         {
-            log_debug("client fd=%d: origin closed connection", cfd);
+            log_debug("client fd=%d: origin closed connection, marking complete", cfd);
+            cache_mark_complete(entry);
+            break;
+        }
+
+        if (cache_append_data(entry, serv_buf, (size_t)n) != 0) 
+        {
+            log_error("client fd=%d: cache_append_data failed", cfd);
+            cache_mark_failed(entry);
             break;
         }
 
         if (send_all(cfd, serv_buf, (size_t)n) < 0) 
-        {
             log_error("client fd=%d: send_all to client failed: %s", cfd, strerror(errno));
-            break;
-        }
     }
 
     close(ofd);
     close(cfd);
+    cache_release(cache, entry);
     log_debug("client fd=%d: handler finished", cfd);
 }
 
@@ -313,6 +397,9 @@ static void handle_client(void *arg)
 int proxy_run(const proxy_config_t *cfg) 
 {
     signal(SIGPIPE, SIG_IGN);
+
+    cache_table_t cache;
+    cache_table_init(&cache);
 
     threadPool_t *pool = threadPoolCreate(cfg->worker_count);
     if (!pool) 
@@ -355,6 +442,7 @@ int proxy_run(const proxy_config_t *cfg)
         }
 
         ctx->client_fd = cfd;
+        ctx->cache = &cache;
 
         if (threadPoolSubmit(pool, handle_client, ctx) != 0) 
         {
