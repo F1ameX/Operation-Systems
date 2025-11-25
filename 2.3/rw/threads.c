@@ -12,9 +12,14 @@
 static long asc_iterations   = 0;
 static long desc_iterations  = 0;
 static long equal_iterations = 0;
-static long asc_swaps   = 0;
-static long desc_swaps  = 0;
-static long equal_swaps = 0;
+
+static long asc_pairs = 0; // пары с l1 <  l2
+static long desc_pairs = 0; // пары с l1 >  l2
+static long equal_pairs = 0; // пары с l1 == l2
+
+static long asc_swaps = 0; // свопы, исправляющие "не-возрастание"
+static long desc_swaps = 0; // свопы, исправляющие "не-убывание"
+static long equal_swaps = 0; // свопы, исправляющие "не-равенство"
 
 static pthread_mutex_t counters_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -39,11 +44,12 @@ static void snapshot_counters(long *ai, long *di, long *ei, long *as, long *ds, 
 
 typedef int (*pair_predicate)(int l1, int l2);
 
-static int pred_asc(int l1, int l2)   { return l1 < l2; }
-static int pred_desc(int l1, int l2)  { return l1 > l2; }
+static int pred_less(int l1, int l2) { return l1 <  l2; }
+static int pred_greater(int l1, int l2) { return l1 >  l2; }
 static int pred_equal(int l1, int l2) { return l1 == l2; }
+static int pred_not_equal(int l1, int l2) { return l1 !=  l2; }
 
-static void traverse_list(Storage *s, pair_predicate pred, long *iter_counter)
+static void traverse_list(Storage *s, pair_predicate match_pred, long *iter_counter, long *pairs_counter)
 {
     while (1)
     {
@@ -65,16 +71,17 @@ static void traverse_list(Storage *s, pair_predicate pred, long *iter_counter)
         while (1)
         {
             b = a->next;
-            if (!b)
-                break;
+            if (!b) break;
 
             pthread_rwlock_rdlock(&b->sync);
 
             int l1 = (int)strlen(a->value);
             int l2 = (int)strlen(b->value);
 
+            if (match_pred(l1, l2)) inc_long(pairs_counter);
+
             pthread_rwlock_unlock(&a->sync);
-            a = b;
+            a = b;         
         }
 
         pthread_rwlock_unlock(&a->sync);
@@ -84,19 +91,19 @@ static void traverse_list(Storage *s, pair_predicate pred, long *iter_counter)
 
 void *thread_asc(void *arg)
 {
-    traverse_list((Storage *)arg, pred_asc, &asc_iterations);
+    traverse_list((Storage *)arg, pred_less, &asc_iterations, &asc_pairs);
     return NULL;
 }
 
 void *thread_desc(void *arg)
 {
-    traverse_list((Storage *)arg, pred_desc, &desc_iterations);
+    traverse_list((Storage *)arg, pred_greater, &desc_iterations, &desc_pairs);
     return NULL;
 }
 
 void *thread_equal(void *arg)
 {
-    traverse_list((Storage *)arg, pred_equal, &equal_iterations);
+    traverse_list((Storage *)arg, pred_equal, &equal_iterations, &equal_pairs);
     return NULL;
 }
 
@@ -161,7 +168,7 @@ void *thread_swap_asc(void *arg)
 
     while (1)
     {
-        do_random_swap(s, pred_asc, &asc_swaps, &seed);
+        do_random_swap(s, pred_greater, &asc_swaps, &seed);
         sched_yield();
     }
     return NULL;
@@ -174,7 +181,7 @@ void *thread_swap_desc(void *arg)
 
     while (1)
     {
-        do_random_swap(s, pred_desc, &desc_swaps, &seed);
+        do_random_swap(s, pred_less, &desc_swaps, &seed);
         sched_yield();
     }
     return NULL;
@@ -187,7 +194,7 @@ void *thread_swap_equal(void *arg)
 
     while (1)
     {
-        do_random_swap(s, pred_equal, &equal_swaps, &seed);
+        do_random_swap(s, pred_not_equal, &equal_swaps, &seed);
         sched_yield();
     }
     return NULL;
