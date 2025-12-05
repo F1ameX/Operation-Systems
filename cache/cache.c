@@ -1,172 +1,242 @@
 #include "cache/cache.h"
 #include "logger/logger.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
-static unsigned long hash_key(const char *s) 
+#define CACHE_DEFAULT_BUCKETS 1024
+
+static unsigned long hash_key(const char *s)
 {
-    unsigned long h = 1469598103934665603ull;
-    while (*s) 
-    {
-        h ^= (unsigned char)(*s++);
-        h *= 1099511628211ull;
-    }
+    unsigned long h = 5381;
+    int c;
+    while ((c = (unsigned char)*s++) != 0)
+        h = ((h << 5) + h) + (unsigned long)c;
     return h;
 }
 
-void cache_table_init(cache_table_t *table) 
+
+static cache_entry_t *cache_entry_create(const char *key)
 {
-    memset(table->buckets, 0, sizeof(table->buckets));
-    pthread_mutex_init(&table->lock, NULL);
-    log_debug("cache table initialized");
+    cache_entry_t *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+
+    e->key = strdup(key);
+    if (!e->key)
+    {
+        free(e);
+        return NULL;
+    }
+
+    e->data     = NULL;
+    e->size     = 0;
+    e->capacity = 0;
+    e->complete = 0;
+    e->failed   = 0;
+    e->refcnt   = 1;
+    e->next     = NULL;
+
+    if (pthread_mutex_init(&e->lock, NULL) != 0)
+    {
+        free(e->key);
+        free(e);
+        return NULL;
+    }
+    if (pthread_cond_init(&e->cond, NULL) != 0)
+    {
+        pthread_mutex_destroy(&e->lock);
+        free(e->key);
+        free(e);
+        return NULL;
+    }
+
+    return e;
 }
 
-static int ensure_capacity(cache_entry_t *entry, size_t need) 
+static void cache_entry_destroy(cache_entry_t *e)
 {
-    if (need <= entry->capacity) return 0;
+    if (!e) return;
+    pthread_mutex_destroy(&e->lock);
+    pthread_cond_destroy(&e->cond);
+    free(e->data);
+    free(e->key);
+    free(e);
+}
 
-    size_t newcap = entry->capacity ? entry->capacity * 2 : 8192;
-    while (newcap < need) newcap *= 2;
-    
-    char *p = realloc(entry->data, newcap);
-    if (!p) return -1;
+/* ============ API ============ */
 
-    entry->data = p;
-    entry->capacity = newcap;
+int cache_table_init(cache_table_t *t)
+{
+    if (!t) return -1;
+
+    t->nbuckets = CACHE_DEFAULT_BUCKETS;
+    t->buckets  = calloc(t->nbuckets, sizeof(cache_entry_t *));
+    if (!t->buckets)
+        return -1;
+
+    if (pthread_mutex_init(&t->lock, NULL) != 0)
+    {
+        free(t->buckets);
+        t->buckets = NULL;
+        return -1;
+    }
+
+    log_debug("cache table initialized");
     return 0;
 }
 
-cache_entry_t *cache_start_or_join(cache_table_t *table, const char *key, int *am_writer)
+void cache_table_destroy(cache_table_t *t)
 {
-    *am_writer = 0;
-    pthread_mutex_lock(&table->lock);
+    if (!t || !t->buckets) return;
+
+    for (size_t i = 0; i < t->nbuckets; ++i)
+    {
+        cache_entry_t *e = t->buckets[i];
+        while (e)
+        {
+            cache_entry_t *next = e->next;
+            cache_entry_destroy(e);
+            e = next;
+        }
+    }
+
+    free(t->buckets);
+    t->buckets = NULL;
+    pthread_mutex_destroy(&t->lock);
+}
+
+cache_entry_t *cache_start_or_join(cache_table_t *t, const char *key, int *am_writer)
+{
+    if (!t || !key || !am_writer) return NULL;
 
     unsigned long h = hash_key(key);
-    size_t idx = h % CACHE_BUCKETS;
+    size_t idx = h % t->nbuckets;
 
-    cache_entry_t *e = table->buckets[idx];
-    while (e) 
+    pthread_mutex_lock(&t->lock);
+
+    cache_entry_t *e = t->buckets[idx];
+    while (e)
     {
-        if (strcmp(e->key, key) == 0) 
+        if (strcmp(e->key, key) == 0)
         {
             e->refcnt++;
+            *am_writer = 0;
+            pthread_mutex_unlock(&t->lock);
             log_debug("cache HIT key='%s', refcnt=%d", key, e->refcnt);
-            pthread_mutex_unlock(&table->lock);
             return e;
         }
         e = e->next;
     }
 
-    e = calloc(1, sizeof(*e));
-    if (!e) 
+    e = cache_entry_create(key);
+    if (!e)
     {
-        log_error("cache_start_or_join: malloc failed for key '%s'", key);
-        pthread_mutex_unlock(&table->lock);
+        pthread_mutex_unlock(&t->lock);
+        log_error("cache_start_or_join: failed to create entry for key='%s'", key);
         return NULL;
     }
 
-    e->key = strdup(key);
-    e->data = NULL;
-    e->size = 0;
-    e->capacity = 0;
-    e->complete = 0;
-    e->failed = 0;
-    e->refcnt = 1;
-
-    pthread_mutex_init(&e->lock, NULL);
-    pthread_cond_init(&e->cond, NULL);
-
-    e->next = table->buckets[idx];
-    table->buckets[idx] = e;
+    e->next = t->buckets[idx];
+    t->buckets[idx] = e;
 
     *am_writer = 1;
-    log_debug("cache MISS, new entry key='%s'", key);
+    pthread_mutex_unlock(&t->lock);
 
-    pthread_mutex_unlock(&table->lock);
+    log_debug("cache MISS, new entry key='%s'", key);
     return e;
 }
 
-void cache_release(cache_table_t *table, cache_entry_t *entry) 
+int cache_append_data(cache_entry_t *e, const void *data, size_t len)
 {
-    pthread_mutex_lock(&table->lock);
+    if (!e || !data || len == 0) return 0;
 
-    entry->refcnt--;
-    log_debug("cache_release key='%s', new refcnt=%d", entry->key, entry->refcnt);
+    pthread_mutex_lock(&e->lock);
 
-    if (entry->refcnt > 0) 
+    if (e->failed)
     {
-        pthread_mutex_unlock(&table->lock);
+        pthread_mutex_unlock(&e->lock);
+        return -1;
+    }
+
+    size_t need = e->size + len;
+    if (need > e->capacity)
+    {
+        size_t newcap = e->capacity ? e->capacity * 2 : 64 * 1024;
+        if (newcap < need)
+            newcap = need;
+
+        char *newdata = realloc(e->data, newcap);
+        if (!newdata)
+        {
+            e->failed = 1;
+            pthread_cond_broadcast(&e->cond);
+            pthread_mutex_unlock(&e->lock);
+            log_error("cache_append_data: realloc to %zu bytes failed", newcap);
+            return -1;
+        }
+
+        e->data     = newdata;
+        e->capacity = newcap;
+    }
+
+    memcpy(e->data + e->size, data, len);
+    e->size += len;
+
+    pthread_cond_broadcast(&e->cond);
+    pthread_mutex_unlock(&e->lock);
+
+    return 0;
+}
+
+void cache_mark_complete(cache_entry_t *e)
+{
+    if (!e) return;
+    pthread_mutex_lock(&e->lock);
+    e->complete = 1;
+    pthread_cond_broadcast(&e->cond);
+    pthread_mutex_unlock(&e->lock);
+}
+
+void cache_mark_failed(cache_entry_t *e)
+{
+    if (!e) return;
+    pthread_mutex_lock(&e->lock);
+    e->failed = 1;
+    pthread_cond_broadcast(&e->cond);
+    pthread_mutex_unlock(&e->lock);
+}
+
+void cache_release(cache_table_t *t, cache_entry_t *e)
+{
+    if (!t || !t->buckets || !e) return;
+
+    pthread_mutex_lock(&t->lock);
+
+    e->refcnt--;
+    if (e->refcnt > 0)
+    {
+        pthread_mutex_unlock(&t->lock);
+        log_debug("cache_release key='%s', new refcnt=%d", e->key, e->refcnt);
         return;
     }
 
-    unsigned long h = hash_key(entry->key);
-    size_t idx = h % CACHE_BUCKETS;
+    unsigned long h = hash_key(e->key);
+    size_t idx = h % t->nbuckets;
 
-    cache_entry_t **pp = &table->buckets[idx];
-    while (*pp) 
+    cache_entry_t **pp = &t->buckets[idx];
+    while (*pp)
     {
-        if (*pp == entry) 
+        if (*pp == e)
         {
-            *pp = entry->next;
+            *pp = e->next;
             break;
         }
         pp = &(*pp)->next;
     }
 
-    pthread_mutex_unlock(&table->lock);
-    pthread_mutex_destroy(&entry->lock);
-    pthread_cond_destroy(&entry->cond);
-    free(entry->data);
-    free(entry->key);
-    free(entry);
+    pthread_mutex_unlock(&t->lock);
 
-    log_debug("cache entry fully freed");
-}
-
-int cache_append_data(cache_entry_t *entry, const void *buf, size_t len) 
-{
-    pthread_mutex_lock(&entry->lock);
-
-    if (entry->failed) 
-    {
-        pthread_mutex_unlock(&entry->lock);
-        return -1;
-    }
-
-    size_t need = entry->size + len;
-    if (ensure_capacity(entry, need) != 0) 
-    {
-        entry->failed = 1;
-        pthread_cond_broadcast(&entry->cond);
-        pthread_mutex_unlock(&entry->lock);
-        log_error("cache_append_data: realloc failed");
-        return -1;
-    }
-
-    memcpy(entry->data + entry->size, buf, len);
-    entry->size += len;
-
-    pthread_cond_broadcast(&entry->cond);
-    pthread_mutex_unlock(&entry->lock);
-    return 0;
-}
-
-void cache_mark_complete(cache_entry_t *entry) 
-{
-    pthread_mutex_lock(&entry->lock);
-    entry->complete = 1;
-    pthread_cond_broadcast(&entry->cond);
-    pthread_mutex_unlock(&entry->lock);
-    log_debug("cache_mark_complete for key='%s'", entry->key);
-}
-
-void cache_mark_failed(cache_entry_t *entry) 
-{
-    pthread_mutex_lock(&entry->lock);
-    entry->failed = 1;
-    pthread_cond_broadcast(&entry->cond);
-    pthread_mutex_unlock(&entry->lock);
-    log_error("cache_mark_failed for key='%s'", entry->key);
+    log_debug("cache entry fully freed key='%s'", e->key);
+    cache_entry_destroy(e);
 }

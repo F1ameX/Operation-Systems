@@ -169,7 +169,15 @@ static void stream_from_cache(cache_entry_t *entry, int client_fd)
 
         if (send_all(client_fd, tmp, chunk) < 0) 
         {
-            log_error("stream_from_cache: send_all to client fd=%d failed: %s", client_fd, strerror(errno));
+            if (errno == EPIPE || errno == ECONNRESET) 
+            {
+                log_info("stream_from_cache: client fd=%d closed connection", client_fd);
+            } 
+            else 
+            {
+                log_error("stream_from_cache: send_all to client fd=%d failed: %s",
+                          client_fd, strerror(errno));
+            }
             break;
         }
     }
@@ -177,8 +185,8 @@ static void stream_from_cache(cache_entry_t *entry, int client_fd)
 
 static void handle_client(void *arg) 
 {
-    client_ctx_t *ctx = (client_ctx_t *)arg;
-    int cfd = ctx->client_fd;
+    client_ctx_t *ctx    = (client_ctx_t *)arg;
+    int           cfd    = ctx->client_fd;
     cache_table_t *cache = ctx->cache;
     free(ctx);
 
@@ -197,7 +205,6 @@ static void handle_client(void *arg)
             close(cfd);
             return;
         }
-
         if (n == 0) 
         {
             log_info("client fd=%d: closed connection before headers", cfd);
@@ -358,6 +365,7 @@ static void handle_client(void *arg)
     }
 
     char serv_buf[8192];
+    int client_alive = 1;
     for (;;) 
     {
         ssize_t n = recv(ofd, serv_buf, sizeof(serv_buf), 0);
@@ -368,7 +376,6 @@ static void handle_client(void *arg)
             cache_mark_failed(entry);
             break;
         }
-
         if (n == 0) 
         {
             log_debug("client fd=%d: origin closed connection, marking complete", cfd);
@@ -383,8 +390,22 @@ static void handle_client(void *arg)
             break;
         }
 
-        if (send_all(cfd, serv_buf, (size_t)n) < 0) 
-            log_error("client fd=%d: send_all to client failed: %s", cfd, strerror(errno));
+        if (client_alive) 
+        {
+            if (send_all(cfd, serv_buf, (size_t)n) < 0) 
+            {
+                if (errno == EPIPE || errno == ECONNRESET) 
+                {
+                    log_info("client fd=%d: closed connection while writing, continue caching", cfd);
+                    client_alive = 0;
+                } 
+                else 
+                {
+                    log_error("client fd=%d: send_all to client failed: %s", cfd, strerror(errno));
+                    client_alive = 0;
+                }
+            }
+        }
     }
 
     close(ofd);
@@ -399,12 +420,17 @@ int proxy_run(const proxy_config_t *cfg)
     signal(SIGPIPE, SIG_IGN);
 
     cache_table_t cache;
-    cache_table_init(&cache);
+    if (cache_table_init(&cache) != 0) 
+    {
+        log_error("failed to init cache table");
+        return 1;
+    }
 
     threadPool_t *pool = threadPoolCreate(cfg->worker_count);
     if (!pool) 
     {
         log_error("failed to create thread pool");
+        cache_table_destroy(&cache);
         return 1;
     }
 
@@ -413,6 +439,7 @@ int proxy_run(const proxy_config_t *cfg)
     {
         log_error("failed to create listen socket on port %d", cfg->listen_port);
         threadPoolStop(pool);
+        cache_table_destroy(&cache);
         return 1;
     }
 
@@ -455,6 +482,7 @@ int proxy_run(const proxy_config_t *cfg)
 
     close(lfd);
     threadPoolStop(pool);
+    cache_table_destroy(&cache);
     log_info("proxy stopped");
     return 0;
 }
