@@ -32,6 +32,9 @@ static void vlog_internal(log_level_t lvl, const char *tag, const char *fmt, va_
     struct tm tmv;
     localtime_r(&t, &tmv);
 
+    va_list ap2;
+    va_copy(ap2, ap);
+
     fprintf(stderr, "[%02d:%02d:%02d] %s ", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, tag);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
@@ -39,7 +42,7 @@ static void vlog_internal(log_level_t lvl, const char *tag, const char *fmt, va_
     if (g_log_file) 
     {
         fprintf(g_log_file, "[%02d:%02d:%02d] %s ", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, tag);
-        vfprintf(g_log_file, fmt, ap);
+        vfprintf(g_log_file, fmt, ap2);
         fprintf(g_log_file, "\n");
         fflush(g_log_file);
     }
