@@ -64,8 +64,6 @@ static void cache_entry_destroy(cache_entry_t *e)
     free(e);
 }
 
-/* ============ API ============ */
-
 int cache_table_init(cache_table_t *t)
 {
     if (!t) return -1;
@@ -120,6 +118,44 @@ cache_entry_t *cache_start_or_join(cache_table_t *t, const char *key, int *am_wr
     {
         if (strcmp(e->key, key) == 0)
         {
+            pthread_mutex_lock(&e->lock);
+            int is_failed = e->failed;
+            pthread_mutex_unlock(&e->lock);
+
+            if (is_failed && e->refcnt == 0)
+            {
+                cache_entry_t **pp = &t->buckets[idx];
+                while (*pp)
+                {
+                    if (*pp == e)
+                    {
+                        *pp = e->next;
+                        break;
+                    }
+                    pp = &(*pp)->next;
+                }
+
+                log_debug("cache DROP failed entry key='%s', recreating", key);
+                cache_entry_destroy(e);
+
+                e = cache_entry_create(key);
+                if (!e)
+                {
+                    pthread_mutex_unlock(&t->lock);
+                    log_error("cache_start_or_join: failed to create entry for key='%s'", key);
+                    return NULL;
+                }
+
+                e->next = t->buckets[idx];
+                t->buckets[idx] = e;
+
+                *am_writer = 1;
+                pthread_mutex_unlock(&t->lock);
+
+                log_debug("cache MISS, new entry key='%s'", key);
+                return e;
+            }
+
             e->refcnt++;
             *am_writer = 0;
             pthread_mutex_unlock(&t->lock);
@@ -221,6 +257,17 @@ void cache_release(cache_table_t *t, cache_entry_t *e)
         return;
     }
 
+    pthread_mutex_lock(&e->lock);
+    int keep = (e->complete && !e->failed);
+    pthread_mutex_unlock(&e->lock);
+
+    if (keep)
+    {
+        pthread_mutex_unlock(&t->lock);
+        log_debug("cache KEEP key='%s' (complete, refcnt=0)", e->key);
+        return;
+    }
+
     unsigned long h = hash_key(e->key);
     size_t idx = h % t->nbuckets;
 
@@ -237,6 +284,6 @@ void cache_release(cache_table_t *t, cache_entry_t *e)
 
     pthread_mutex_unlock(&t->lock);
 
-    log_debug("cache entry fully freed key='%s'", e->key);
+    log_debug("cache entry freed key='%s' (failed/incomplete)", e->key);
     cache_entry_destroy(e);
 }

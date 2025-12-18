@@ -366,12 +366,30 @@ static void handle_client(void *arg)
 
     char serv_buf[8192];
     int client_alive = 1;
+    size_t total_from_origin = 0;
     for (;;) 
     {
         ssize_t n = recv(ofd, serv_buf, sizeof(serv_buf), 0);
         if (n < 0) 
         {
             if (errno == EINTR) continue;
+
+            if (errno == ECONNRESET)
+            {
+                if (total_from_origin > 0)
+                {
+                    log_debug("client fd=%d: origin reset after %zu bytes, treat as complete",
+                            cfd, total_from_origin);
+                    cache_mark_complete(entry);
+                }
+                else
+                {
+                    log_error("client fd=%d: origin reset before any data", cfd);
+                    cache_mark_failed(entry);
+                }
+                break;
+            }
+
             log_error("client fd=%d: recv from origin failed: %s", cfd, strerror(errno));
             cache_mark_failed(entry);
             break;
@@ -382,6 +400,8 @@ static void handle_client(void *arg)
             cache_mark_complete(entry);
             break;
         }
+
+        total_from_origin += (size_t)n;
 
         if (cache_append_data(entry, serv_buf, (size_t)n) != 0) 
         {
@@ -406,7 +426,7 @@ static void handle_client(void *arg)
                 }
             }
         }
-    }
+    }   
 
     close(ofd);
     close(cfd);
